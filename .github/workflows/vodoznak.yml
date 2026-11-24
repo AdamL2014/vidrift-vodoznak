@@ -1,0 +1,22 @@
+name: Vodoznak do videí
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # každých 5 minut se podívá po nových videích
+  workflow_dispatch: {}
+concurrency:
+  group: vodoznak
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  vodoznak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nainstalovat ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core python3-pil
+      - name: Vypálit vodoznak
+        env:
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python3 worker.py
