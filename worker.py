@@ -11,7 +11,10 @@ API = os.environ.get('VIDRIFT_API', 'https://okcnditfcurqegbeshqc.supabase.co/fu
 TOKEN = os.environ.get('WORKER_TOKEN', '')
 LOGO_URL = 'https://vidriftvideo.netlify.app/icons/icon-192.png'
 FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
-TIME_LIMIT = 20 * 60  # jedna běžící akce zpracuje videa nejvýš 20 minut, pak skončí
+TIME_LIMIT = 20 * 60
+AI60_MAX = 10 * 60  # delší videa než 10 min se na 60 fps nepřepočítávají (trvalo by to moc dlouho)
+# „AI 60 FPS“: dopočítání chybějících snímků podle pohybu (motion-compensated interpolace)
+INTERP = ',minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1'  # jedna běžící akce zpracuje videa nejvýš 20 minut, pak skončí
 
 
 def api(action, **body):
@@ -40,11 +43,21 @@ def upload(url, path):
 
 
 def probe(path):
-    out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height:format=duration',
+    out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate:format=duration',
                           '-of', 'json', path], capture_output=True, text=True, check=True).stdout
     j = json.loads(out)
     s = j['streams'][0]
     return int(s['width']), int(s['height']), float(j.get('format', {}).get('duration') or 0)
+
+
+def fps(path):
+    out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=avg_frame_rate',
+                          '-of', 'default=nw=1:nk=1', path], capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        a, b = out.split('/')
+        return float(a) / float(b) if float(b) else 0.0
+    except ValueError:
+        return float(out or 0)
 
 
 def target(w, h, short_max):
@@ -62,6 +75,28 @@ def text_width(text, size):
         return round(ImageFont.truetype(FONT, size).getlength(text))
     except Exception:
         return round(size * 0.68 * len(text))
+
+
+def smooth60(src, dst, short_max):
+    """Dopočítá snímky na 60 fps. Filtr běží jen na 1 jádře, proto video rozdělíme na kousky podle počtu jader."""
+    w, h, dur = probe(src)
+    tw, th = target(w, h, short_max)
+    n = max(1, min(os.cpu_count() or 1, int(dur // 4) or 1))
+    part = dur / n
+    d = os.path.dirname(dst)
+    names = [os.path.join(d, f'part{i}.mp4') for i in range(n)]
+    procs = [subprocess.Popen(['ffmpeg', '-y', '-loglevel', 'error', '-ss', f'{i * part:.3f}', '-i', src, '-t', f'{part:.3f}', '-an',
+                               '-vf', f'scale={tw}:{th},setsar=1' + INTERP, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16',
+                               '-pix_fmt', 'yuv420p', names[i]]) for i in range(n)]
+    if any(p.wait() for p in procs):
+        raise RuntimeError('interpolace selhala')
+    lst = os.path.join(d, 'parts.txt')
+    with open(lst, 'w') as f:
+        f.writelines(f"file '{x}'\n" for x in names)
+    subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', lst, '-i', src, '-map', '0:v', '-map', '1:a?',
+                    '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-shortest', dst], check=True)
+    for x in names + [lst]:
+        os.remove(x)
 
 
 def watermark(src, dst, logo, username, short_max):
@@ -98,11 +133,15 @@ def watermark(src, dst, logo, username, short_max):
     return dur
 
 
-def low(src, dst):
+def shrink(src, dst, short_max, crf, abr):
     w, h, _ = probe(src)
-    tw, th = target(w, h, 480)
+    tw, th = target(w, h, short_max)
     subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', src, '-vf', f'scale={tw}:{th}', '-c:v', 'libx264', '-preset', 'veryfast',
-                    '-crf', '27', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'aac', '-b:a', '96k', dst], check=True)
+                    '-crf', str(crf), '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'aac', '-b:a', abr, dst], check=True)
+
+
+def low(src, dst):
+    shrink(src, dst, 480, 27, '96k')
 
 
 def main():
@@ -120,21 +159,32 @@ def main():
             jid = job['id']
             print('Zpracovávám', jid)
             try:
-                src, out, lo = (os.path.join(d, n) for n in ('in.bin', 'out.mp4', 'low.mp4'))
+                src, out, lo, hq = (os.path.join(d, n) for n in ('in.bin', 'out.mp4', 'low.mp4', 'hq.mp4'))
                 download(job['get'], src)
-                dur = watermark(src, out, logo, job['username'], 720)
+                w, h, _ = probe(src)
+                has_hq = bool(job.get('wantHq') and job.get('putHq')) and min(w, h) >= 1000
+                if job.get('ai60') and fps(src) < 50 and probe(src)[2] <= AI60_MAX:   # už 60fps video nepřepočítáváme
+                    sm = os.path.join(d, 'smooth.mp4')
+                    smooth60(src, sm, 1080 if has_hq else 720)
+                    os.replace(sm, src)
+                if has_hq:   # Full HD verze (u AI 60 FPS i plynulá) a 720p se udělá z ní – dopočet snímků jen jednou
+                    dur = watermark(src, hq, logo, job['username'], 1080)
+                    upload(job['putHq'], hq)
+                    shrink(hq, out, 720, 23, '128k')
+                else:
+                    dur = watermark(src, out, logo, job['username'], 720)
                 upload(job['put'], out)
                 has_low = False
                 if job.get('hasLow'):
                     low(out, lo); upload(job['putLow'], lo); has_low = True
-                api('job_done', id=jid, low=has_low, duration_s=dur)
+                api('job_done', id=jid, low=has_low, hq=has_hq, duration_s=dur)
                 print('Hotovo', jid)
             except Exception as e:  # nevyšlo → server to za 30 min zkusí znovu
                 print('Chyba', jid, e)
                 try: api('job_fail', id=jid, reason=str(e))
                 except Exception: pass
             finally:
-                for n in ('in.bin', 'out.mp4', 'low.mp4'):
+                for n in ('in.bin', 'out.mp4', 'low.mp4', 'hq.mp4'):
                     try: os.remove(os.path.join(d, n))
                     except OSError: pass
 
