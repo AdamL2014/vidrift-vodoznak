@@ -162,22 +162,30 @@ def main():
                 src, out, lo, hq = (os.path.join(d, n) for n in ('in.bin', 'out.mp4', 'low.mp4', 'hq.mp4'))
                 download(job['get'], src)
                 w, h, _ = probe(src)
-                has_hq = bool(job.get('wantHq') and job.get('putHq')) and min(w, h) >= 1000
-                if job.get('ai60') and fps(src) < 50 and probe(src)[2] <= AI60_MAX:   # už 60fps video nepřepočítáváme
-                    sm = os.path.join(d, 'smooth.mp4')
-                    smooth60(src, sm, 1080 if has_hq else 720)
-                    os.replace(sm, src)
-                if has_hq:   # Full HD verze (u AI 60 FPS i plynulá) a 720p se udělá z ní – dopočet snímků jen jednou
-                    dur = watermark(src, hq, logo, job['username'], 1080)
-                    upload(job['putHq'], hq)
-                    shrink(hq, out, 720, 23, '128k')
-                else:
-                    dur = watermark(src, out, logo, job['username'], 720)
+                if job.get('phase') == 'hq':
+                    # 2. fáze (jako YouTube): video už je venku v 720p, teď se dopočítá Premium kvalita
+                    side = 1080 if min(w, h) >= 1000 else 720
+                    if job.get('ai60') and fps(src) < 50 and probe(src)[2] <= AI60_MAX:   # už 60fps video nepřepočítáváme
+                        sm = os.path.join(d, 'smooth.mp4')
+                        smooth60(src, sm, side)
+                        os.replace(sm, src)
+                    has_hq = side == 1080 or bool(job.get('ai60'))   # 720p bez 60 fps by nebylo nic nového
+                    hq_h = 0
+                    if has_hq:
+                        watermark(src, hq, logo, job['username'], side)
+                        hw, hh, _ = probe(hq); hq_h = min(hw, hh)
+                        upload(job['putHq'], hq)
+                    api('job_done', id=jid, phase='hq', hq=has_hq, hq_height=hq_h)
+                    print('Premium hotovo', jid)
+                    continue
+                # 1. fáze: rychle 720p s vodoznakem, ať se na video dá hned koukat
+                dur = watermark(src, out, logo, job['username'], 720)
                 upload(job['put'], out)
                 has_low = False
                 if job.get('hasLow'):
                     low(out, lo); upload(job['putLow'], lo); has_low = True
-                api('job_done', id=jid, low=has_low, hq=has_hq, duration_s=dur)
+                keep = bool(job.get('wantHq')) and (min(w, h) >= 1000 or bool(job.get('ai60')))
+                api('job_done', id=jid, low=has_low, keep_src=keep, duration_s=dur)
                 print('Hotovo', jid)
             except Exception as e:  # nevyšlo → server to za 30 min zkusí znovu
                 print('Chyba', jid, e)
